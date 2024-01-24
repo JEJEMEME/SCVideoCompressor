@@ -1,7 +1,3 @@
-// The Swift Programming Language
-// https://docs.swift.org/swift-book
-
-
 import Foundation
 import AVFoundation
 import CoreMedia
@@ -98,7 +94,7 @@ public class SCVideoCompressor {
         let naturalSize = try await videoTrack.load(.naturalSize)
         let targetSize = _calculateSizeWithScale(config.scale, originalSize: naturalSize)
         let estimatedDataRate = try await videoTrack.load(.estimatedDataRate)
-        let codecType = videoFirstCodecType(for: videoTrack)
+        let codecType = try await videoFirstCodecType(for: videoTrack)
         let targetVideoBitrate: Float
         if Float(config.videoBitrate) > estimatedDataRate {
             let tempBitrate = estimatedDataRate / 4
@@ -120,7 +116,7 @@ public class SCVideoCompressor {
             
             audioBitrate = 128_000
             audioSampleRate = 44100
-            audioSettings = _createAudioSettingsWithAudioTrack(adTrack, bitrate: Float(audioBitrate), sampleRate: audioSampleRate)
+            audioSettings = try await _createAudioSettingsWithAudioTrack(adTrack, bitrate: Float(audioBitrate), sampleRate: audioSampleRate)
         }
         var _outputPath: URL
         if let outputPath = config.outputPath {
@@ -143,28 +139,21 @@ public class SCVideoCompressor {
         print("scale size: (\(targetSize))")
         print("****************************************")
 #endif
-        return try await withCheckedThrowingContinuation { continuation in
-                // Original implementation
-                _compress(asset: asset,
-                          fileType: .mp4,
-                          videoTrack,
-                          videoSettings,
-                          audioTrack,
-                          audioSettings,
-                          outputPath: _outputPath,
-                          startTime: CMTime(value: 0, timescale: 600),
-                          endTime: endTime,
-                          metadata: metadata) { result in
-                    // Handle the completion
-                    switch result {
-                    case .success(let compressedVideoURL):
-                        continuation.resume(returning: compressedVideoURL)
-                    case .failure(let error):
-                        continuation.resume(throwing: error)
-                    }
-                }
+        do {
+            let compressedURL = try await _compress(asset: asset,
+                      fileType: .mp4,
+                      videoTrack,
+                      videoSettings,
+                      audioTrack,
+                      audioSettings,
+                      outputPath: _outputPath,
+                      startTime: CMTime(value: 0, timescale: 600),
+                      endTime: endTime,
+                      metadata: metadata)
+            return compressedURL
+        } catch {
+            throw error
         }
-        //return URL(string:"")!
     }
     
     private func _calculateSizeWithScale(_ scale: CGSize?, originalSize: CGSize) -> CGSize {
@@ -207,22 +196,24 @@ public class SCVideoCompressor {
         ]
     }
     
-    private func videoFirstCodecType(for track: AVAssetTrack) -> AVVideoCodecType {
-        guard let formatDescriptions = track.formatDescriptions as? [CMFormatDescription] else { return .h264 }
+    private func videoFirstCodecType(for track: AVAssetTrack) async throws -> AVVideoCodecType {
+        let formatDescriptions = try await track.load(.formatDescriptions)
         let codecs = formatDescriptions.compactMap { CMFormatDescriptionGetMediaSubType($0) }
-        
         if codecs.contains(kCMVideoCodecType_HEVC) {
             return .hevc
         } else {
             return .h264
         }
     }
-    
-    private func _createAudioSettingsWithAudioTrack(_ audioTrack: AVAssetTrack, bitrate: Float, sampleRate: Int) -> [String: Any] {
-#if DEBUG
-        if let audioFormatDescs = audioTrack.formatDescriptions as? [CMFormatDescription], let formatDescription = audioFormatDescs.first {
+
+
+    private func _createAudioSettingsWithAudioTrack(_ audioTrack: AVAssetTrack, bitrate: Float, sampleRate: Int) async throws -> [String: Any] {
+        let formatDescriptions = try await audioTrack.load(.formatDescriptions)
+
+        #if DEBUG
+        if let formatDescription = formatDescriptions.first {
             print("🔊 Audio")
-            print("ORINGIAL:")
+            print("ORIGINAL:")
             if let streamBasicDescription = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription) {
                 print("sampleRate: \(streamBasicDescription.pointee.mSampleRate)")
                 print("channels: \(streamBasicDescription.pointee.mChannelsPerFrame)")
@@ -232,10 +223,8 @@ public class SCVideoCompressor {
             print("TARGET:")
             print("bitrate: \(bitrate)")
             print("sampleRate: \(sampleRate)")
-//            print("channels: \(2)")
-            print("formatID: \(kAudioFormatMPEG4AAC)")
         }
-#endif
+        #endif
         
         var audioChannelLayout = AudioChannelLayout()
         memset(&audioChannelLayout, 0, MemoryLayout<AudioChannelLayout>.size)
@@ -249,7 +238,7 @@ public class SCVideoCompressor {
             AVChannelLayoutKey: Data(bytes: &audioChannelLayout, count: MemoryLayout<AudioChannelLayout>.size)
         ]
     }
-    
+
     private func _compress(asset: AVAsset,
                            fileType: AVFileType,
                            _ videoTrack: AVAssetTrack,
@@ -259,20 +248,19 @@ public class SCVideoCompressor {
                            outputPath: URL,
                            startTime: CMTime, // Added start time parameter
                            endTime: CMTime,   // Added end time parameter
-                           metadata: [AVMetadataItem] = [],
-                           completion: @escaping (Result<URL, Error>) -> Void) {
+                           metadata: [AVMetadataItem] = []) async throws -> URL {
         // video
         let videoOutput = AVAssetReaderTrackOutput.init(track: videoTrack,
                                                         outputSettings: [kCVPixelBufferPixelFormatTypeKey as String:
                                                                             kCVPixelFormatType_32BGRA])
         let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        videoInput.transform = videoTrack.preferredTransform // fix output video orientation
+        let preferredTransform = try await videoTrack.load(.preferredTransform)
+        videoInput.transform = preferredTransform
         do {
             guard FileManager.default.isValidDirectory(atPath: outputPath) else {
-                completion(.failure(VideoCompressorError.outputPathNotValid(outputPath)))
-                return
+                throw VideoCompressorError.outputPathNotValid(outputPath)
             }
-            let assetDuration = asset.duration
+            let assetDuration = try await asset.load(.duration) //asset.duration
             var outputPath = outputPath
             let videoName = UUID().uuidString + ".\(fileType.fileExtension)"
             let adjustedStartTime = min(startTime, assetDuration)
@@ -294,7 +282,7 @@ public class SCVideoCompressor {
             // 메타데이터 추가
             writer.metadata = metadata
             reader.timeRange = timeRange
-
+            
             // video output
             if reader.canAdd(videoOutput) {
                 reader.add(videoOutput)
@@ -325,34 +313,37 @@ public class SCVideoCompressor {
 #if DEBUG
             let startTime = Date()
 #endif
-            // start compressing
-            reader.startReading()
-            writer.startWriting()
-            writer.startSession(atSourceTime: CMTime.zero)
-            
-            // output video
-            group.enter()
-            _outputVideoDataByReducingFPS(videoInput: videoInput,
-                                         videoOutput: videoOutput,
-                                         frameIndexArr: []) {
-                self.group.leave()
-            }
-            
-            
-            // output audio
-            if let realAudioInput = audioInput, let realAudioOutput = audioOutput {
-                group.enter()
-                // todo: drop audio sample buffer
-                _outputAudioData(realAudioInput, audioOutput: realAudioOutput, frameIndexArr: []) {
-                    self.group.leave()
-                }
-            }
-            
-            // completion
-            group.notify(queue: .main) {
-                switch writer.status {
-                case .writing, .completed:
-                    writer.finishWriting {
+            return try await withCheckedThrowingContinuation { continuation in
+                do {
+                    // ... AVAssetReader 및 AVAssetWriter 설정 ...
+                    
+                    reader.startReading()
+                    writer.startWriting()
+                    writer.startSession(atSourceTime: CMTime.zero)
+                    
+                    // output video
+                    group.enter()
+                    _outputVideoDataByReducingFPS(videoInput: videoInput,
+                                                 videoOutput: videoOutput,
+                                                 frameIndexArr: []) {
+                        self.group.leave()
+                    }
+                    
+                    
+                    // output audio
+                    if let realAudioInput = audioInput, let realAudioOutput = audioOutput {
+                        group.enter()
+                        // todo: drop audio sample buffer
+                        _outputAudioData(realAudioInput, audioOutput: realAudioOutput, frameIndexArr: []) {
+                            self.group.leave()
+                        }
+                    }
+                    
+                    // 완료 핸들러
+                    group.notify(queue: .main) {
+                        switch writer.status {
+                        case .writing, .completed:
+                            writer.finishWriting {
 #if DEBUG
                         let endTime = Date()
                         let elapse = endTime.timeIntervalSince(startTime)
@@ -363,17 +354,20 @@ public class SCVideoCompressor {
                         print("path: \(outputPath)")
                         print("******************************************")
 #endif
-                        DispatchQueue.main.sync {
-                            completion(.success(outputPath))
+                                continuation.resume(returning: outputPath)
+                            }
+                        default:
+                            if let error = writer.error {
+                                continuation.resume(throwing: error)
+                            } else {
+                                let unknownError = NSError(domain: "VideoCompression", code: 0, userInfo: [NSLocalizedDescriptionKey: "Unknown compression error"])
+                                    continuation.resume(throwing: VideoCompressorError.compressedFailed(unknownError))
+                                
+                            }
                         }
                     }
-                default:
-                    completion(.failure(writer.error!))
                 }
             }
-            
-        } catch {
-            completion(.failure(error))
         }
     }
     
